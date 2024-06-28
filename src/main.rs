@@ -128,8 +128,6 @@ impl LeafNode {
         self.free_list_offset -= value_len;
         let start = self.free_list_offset as usize;
         let end = start + value_len as usize;
-        println!("start {}, end {}", start, end);
-        println!("data length {}", self.data.len());
         self.data[start..end].copy_from_slice(&value);
 
         let slot = Slot {
