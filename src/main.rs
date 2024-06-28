@@ -203,10 +203,33 @@ impl BPlusTree {
         };
         true
     }
+
+    fn search(&self, key: &[u8]) -> Vec<u8> {
+        match &self.root {
+            BPlusTreeNode::Internal(_internal) => (),
+            BPlusTreeNode::Leaf(leaf) => {
+                let key_vec = key.to_vec();
+                let slot = leaf
+                    .slots
+                    .binary_search_by_key(&key_vec, |s| s.key.clone())
+                    .unwrap();
+                let offset = leaf.slots[slot].offset;
+                let length = leaf.slots[slot].length;
+                let start = offset as usize;
+                let end = start + length as usize;
+                let value = &leaf.data[start..end];
+                return value.to_vec();
+            }
+        };
+        Vec::new()
+    }
 }
 
 fn main() {
     let filename = "btree.db";
     let mut tree = BPlusTree::new(filename);
-    tree.insert("key".as_bytes(), "value".as_bytes());
+    tree.insert("key1".as_bytes(), "value1".as_bytes());
+    tree.insert("key2".as_bytes(), "value2".as_bytes());
+    let result = tree.search("key2".as_bytes());
+    println!("the value {:?}", String::from_utf8(result).unwrap());
 }
