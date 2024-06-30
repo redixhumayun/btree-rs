@@ -1,14 +1,17 @@
 #![allow(dead_code)]
 use std::{
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
-    io::{self, Seek, Write},
+    io::{self, Read, Seek, Write},
+    sync::{Arc, Mutex},
 };
 
 const PAGESIZE: usize = 4096;
-const MAX_NUM_OF_KEYS: usize = 30;
+const MAX_NUM_OF_KEYS: usize = 4;
 const MAX_KEY_SIZE: usize = 4;
 
 #[repr(u8)]
+#[derive(Debug, Clone)]
 enum NodeType {
     Header,
     Internal,
@@ -36,23 +39,122 @@ impl From<u8> for NodeType {
     }
 }
 
+struct PageNumber(u8);
+
+#[derive(Debug, Clone)]
+struct PageHeader {
+    node_type: NodeType,
+    page_number: u8,
+}
+
+impl PageHeader {
+    fn serialize(&self, buf: &mut Vec<u8>) {
+        buf.push(u8::from(&self.node_type));
+        buf.extend(self.page_number.to_le_bytes());
+    }
+
+    fn deserialize(buf: Vec<u8>) -> Self {
+        let node_type = NodeType::from(buf[0]);
+        let unknown = buf[1];
+        PageHeader {
+            node_type,
+            page_number: unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InternalNode {
+    header: PageHeader,
+    num_of_children: u8,
+    keys: Vec<i32>,
+    children: Vec<u8>,
+    right_child: u8,
+}
+
+impl InternalNode {
+    fn new(page_number: u8, right_child: u8) -> Self {
+        InternalNode {
+            header: PageHeader {
+                node_type: NodeType::Internal,
+                page_number,
+            },
+            num_of_children: 0,
+            keys: Vec::new(),
+            children: Vec::new(),
+            right_child: 0,
+        }
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut bytes: Vec<u8> = Vec::new();
+        self.header.serialize(&mut bytes);
+        for key in &self.keys {
+            bytes.extend(key.to_le_bytes());
+        }
+        for child in &self.children {
+            bytes.extend(child.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn deserialize(bytes: &[u8]) -> io::Result<Self> {
+        let page_header = PageHeader::deserialize(bytes.to_vec());
+        let num_of_children = bytes[2];
+        let mut offset = 3;
+        let mut keys = Vec::new();
+        let mut children = Vec::new();
+        while offset < bytes.len() {
+            let key_end = offset + MAX_KEY_SIZE;
+            let key = i32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]);
+            keys.push(key);
+            offset = key_end;
+        }
+        let mut children_retrieved = 0;
+        while offset < bytes.len() && children_retrieved < num_of_children {
+            let child = bytes[offset];
+            children.push(child);
+            offset += 8;
+            children_retrieved += 1;
+        }
+        let right_child = bytes[offset];
+        Ok(InternalNode {
+            header: page_header,
+            right_child,
+            num_of_children,
+            keys,
+            children,
+        })
+    }
+
+    fn insert(&mut self, key: i32, left_child: u8) -> bool {
+        let key_insert_position = self.keys.binary_search(&key).unwrap_or_else(|index| index);
+        self.keys.insert(key_insert_position, key);
+        self.children.insert(key_insert_position, left_child);
+        true
+    }
+
+    fn search(&self, key: i32) -> Option<u8> {
+        match self.keys.binary_search(&key) {
+            Ok(key_index) => Some(self.children[key_index]),
+            Err(err) => Some(self.children[err]),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Slot {
     key: Vec<u8>,
     offset: u16,
     length: u16,
 }
 
-struct PageHeader {
-    node_type: NodeType,
-    unknown: u8,
-}
-
-struct InternalNode {
-    header: PageHeader,
-    keys: Vec<i32>,
-    children: Vec<u64>,
-}
-
+#[derive(Debug, Clone)]
 struct LeafNode {
     header: PageHeader,
     free_list_offset: u16,
@@ -62,10 +164,30 @@ struct LeafNode {
 }
 
 impl LeafNode {
+    fn new(page_number: u8) -> Self {
+        let slots_available = MAX_NUM_OF_KEYS;
+        let memory_for_slots = slots_available * std::mem::size_of::<Slot>();
+        let data_size = PAGESIZE
+            - std::mem::size_of::<PageHeader>()
+            - std::mem::size_of::<u16>()
+            - std::mem::size_of::<u16>()
+            - memory_for_slots;
+        LeafNode {
+            header: PageHeader {
+                node_type: NodeType::Leaf,
+                page_number,
+            },
+            free_list_offset: data_size as u16,
+            slot_count: 0,
+            slots: Vec::new(),
+            data: vec![0u8; data_size],
+        }
+    }
+
     fn serialize(&self) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
         bytes.push(u8::from(&self.header.node_type));
-        bytes.extend(self.header.unknown.to_le_bytes());
+        bytes.extend(self.header.page_number.to_le_bytes());
         bytes.extend(self.free_list_offset.to_le_bytes());
         bytes.extend_from_slice(&self.slot_count.to_le_bytes());
         for slot in &self.slots {
@@ -106,7 +228,10 @@ impl LeafNode {
         let data = bytes[offset..].to_vec();
 
         Ok(LeafNode {
-            header: PageHeader { node_type, unknown },
+            header: PageHeader {
+                node_type,
+                page_number: unknown,
+            },
             free_list_offset,
             slot_count,
             slots,
@@ -143,8 +268,73 @@ impl LeafNode {
         self.slot_count += 1;
         true
     }
+
+    fn delete(&mut self, key: &[u8]) -> bool {
+        if key.len() > MAX_KEY_SIZE {
+            return false;
+        }
+        let position = self.slots.binary_search_by_key(&key, |s| &s.key).unwrap();
+        let slot_found = self.slots.get(position).unwrap();
+        assert_eq!(slot_found.key, key);
+
+        //  remove the value associated with the slot
+        let start = slot_found.offset as usize;
+        let end = start + slot_found.length as usize;
+        let shift_distance = end - start;
+        let data_to_move = &self.data[self.free_list_offset as usize..start].to_vec();
+        self.data[self.free_list_offset as usize + shift_distance..start + shift_distance]
+            .copy_from_slice(data_to_move);
+        for slot in &mut self.slots {
+            slot.offset += shift_distance as u16;
+        }
+        self.slot_count -= 1;
+        true
+    }
+
+    fn search(&self, key: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let slot_index = self.slots.binary_search_by_key(&key, |s| &s.key).unwrap();
+        let offset = self.slots[slot_index].offset;
+        let length = self.slots[slot_index].length;
+        let start = offset as usize;
+        let end = start + length as usize;
+        let value = &self.data[start..end];
+        Ok(value.to_vec())
+    }
+
+    fn split(&mut self, new_page_number: u8) -> (Vec<u8>, Self) {
+        println!("splitting leaf node");
+        let midpoint = self.slots.len() / 2;
+
+        let key_to_promote = self.slots[midpoint].key.clone();
+        println!("The key to promote {:?}", key_to_promote);
+        let keys_to_move: Vec<Slot> = self.slots[midpoint + 1..]
+            .iter()
+            .map(|slot| slot.clone())
+            .collect();
+        println!("The keys to move {:?}", keys_to_move);
+        let key_value_pairs: Vec<_> = keys_to_move
+            .iter()
+            .map(|slot| {
+                let start = slot.offset as usize;
+                let end = start + slot.length as usize;
+                let mut data = vec![0; end - start];
+                data.copy_from_slice(&self.data[start..end]);
+                (slot.key.clone(), data)
+            })
+            .collect();
+        println!("the key value pairs being moved {:?}", key_value_pairs);
+        for slot in keys_to_move {
+            self.delete(&slot.key);
+        }
+        let mut new_leaf = LeafNode::new(new_page_number);
+        for key_value in key_value_pairs {
+            new_leaf.insert(&key_value.0, &key_value.1);
+        }
+        (key_to_promote, new_leaf)
+    }
 }
 
+#[derive(Debug, Clone)]
 enum BPlusTreeNode {
     Internal(InternalNode),
     Leaf(LeafNode),
@@ -153,6 +343,8 @@ enum BPlusTreeNode {
 struct BPlusTree {
     root: BPlusTreeNode,
     file: File,
+    next_page_number: u8,
+    cache: Arc<Mutex<HashMap<u8, BPlusTreeNode>>>,
 }
 
 impl BPlusTree {
@@ -163,71 +355,123 @@ impl BPlusTree {
             .create(true)
             .open(filename)
             .expect("Failed to open file");
-        let header = PageHeader {
-            node_type: NodeType::Header,
-            unknown: 0,
+        let root = BPlusTreeNode::Leaf(LeafNode::new(0));
+        BPlusTree {
+            root,
+            file,
+            next_page_number: 1,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn get_new_page_number(&mut self) -> u8 {
+        let ret = self.next_page_number;
+        self.next_page_number += 1;
+        ret
+    }
+
+    fn page_num_to_offset(page_number: u8) -> u64 {
+        page_number as u64 * PAGESIZE as u64
+    }
+
+    fn write_to_cache(&self, page_number: u8, node: &BPlusTreeNode) {
+        self.cache.lock().unwrap().insert(page_number, node.clone());
+    }
+
+    fn write_page(&mut self, node: &BPlusTreeNode, page_number: u8) {
+        let bytes = match node {
+            BPlusTreeNode::Internal(internal) => internal.serialize(),
+            BPlusTreeNode::Leaf(leaf) => leaf.serialize(),
         };
-        let slots_available = MAX_NUM_OF_KEYS;
-        let memory_for_slots = slots_available * std::mem::size_of::<Slot>();
-        let data_size = PAGESIZE
-            - std::mem::size_of::<PageHeader>()
-            - std::mem::size_of::<u16>()
-            - std::mem::size_of::<u16>()
-            - memory_for_slots;
-        let root = BPlusTreeNode::Leaf(LeafNode {
-            header,
-            free_list_offset: data_size as u16,
-            slot_count: 0,
-            slots: Vec::new(),
-            data: vec![0u8; data_size],
-        });
-        BPlusTree { root, file }
+        self.file
+            .seek(io::SeekFrom::Start(BPlusTree::page_num_to_offset(
+                page_number,
+            )))
+            .unwrap();
+        self.file.write_all(&bytes).expect("failed to write node");
+        self.file.sync_all().expect("unable to sync the file");
+    }
+
+    fn read_page(&mut self, page_number: u8) -> BPlusTreeNode {
+        if let Some(node) = self.cache.lock().unwrap().get(&page_number) {
+            return node.clone();
+        }
+
+        let offset = BPlusTree::page_num_to_offset(page_number);
+        self.file.seek(io::SeekFrom::Start(offset)).unwrap();
+        let mut buf = vec![0; PAGESIZE];
+        self.file.read_exact(&mut buf).unwrap();
+
+        let node_type = NodeType::from(buf[0]);
+        match node_type {
+            NodeType::Header => panic!("should not have found header page"),
+            NodeType::Internal => BPlusTreeNode::Internal(InternalNode::deserialize(&buf).unwrap()),
+            NodeType::Leaf => BPlusTreeNode::Leaf(LeafNode::deserialize(&buf).unwrap()),
+        }
     }
 
     fn insert(&mut self, key: &[u8], value: &[u8]) -> bool {
-        match &mut self.root {
-            BPlusTreeNode::Internal(_internal) => (),
-            BPlusTreeNode::Leaf(leaf) => {
-                leaf.insert(key, value);
-                let leaf_bytes = leaf.serialize();
-                self.file
-                    .seek(io::SeekFrom::Start(0))
-                    .expect("error while seeking");
-                self.file
-                    .write_all(&leaf_bytes)
-                    .expect("error while writing");
-                self.file.sync_all().expect("failed to sync data");
-            }
-        };
-        true
+        let mut path: VecDeque<u64> = VecDeque::new();
+        let mut current_node = &mut self.root;
+        loop {
+            match current_node {
+                BPlusTreeNode::Internal(_internal) => (),
+                BPlusTreeNode::Leaf(leaf) => {
+                    if !leaf.insert(key, value) {
+                        let new_leaf_node_page_num = self.next_page_number;
+                        self.next_page_number += 1;
+                        let (key_to_promote, new_leaf_node) = leaf.split(new_leaf_node_page_num);
+                        self.write_to_cache(
+                            new_leaf_node_page_num,
+                            &BPlusTreeNode::Leaf(new_leaf_node),
+                        );
+                        if path.is_empty() {
+                            let new_root_page_number = self.next_page_number;
+                            self.next_page_number += 1;
+                            let mut new_root =
+                                InternalNode::new(new_root_page_number, new_leaf_node_page_num);
+                            let key: i32 = key_to_promote[0].into();
+                            new_root.insert(key, leaf.header.page_number);
+                            self.root = BPlusTreeNode::Internal(new_root);
+                            self.write_to_cache(new_root_page_number, &self.root);
+                        }
+                        return true;
+                    }
+                    return true;
+                }
+            };
+        }
     }
 
-    fn search(&self, key: &[u8]) -> Vec<u8> {
-        match &self.root {
-            BPlusTreeNode::Internal(_internal) => (),
-            BPlusTreeNode::Leaf(leaf) => {
-                let key_vec = key.to_vec();
-                let slot = leaf
-                    .slots
-                    .binary_search_by_key(&key_vec, |s| s.key.clone())
-                    .unwrap();
-                let offset = leaf.slots[slot].offset;
-                let length = leaf.slots[slot].length;
-                let start = offset as usize;
-                let end = start + length as usize;
-                let value = &leaf.data[start..end];
-                return value.to_vec();
+    fn search(&mut self, key: &[u8]) -> Vec<u8> {
+        let mut current_node = self.root.clone();
+        loop {
+            match current_node {
+                BPlusTreeNode::Internal(internal) => {
+                    let bytes: [u8; 4] = key.try_into().unwrap();
+                    let key = i32::from_le_bytes(bytes);
+                    let page_number = internal.search(key).unwrap();
+                    current_node = self.read_page(page_number);
+                }
+                BPlusTreeNode::Leaf(leaf) => {
+                    let value = leaf.search(key).unwrap();
+                    return value;
+                }
             }
-        };
-        Vec::new()
+        }
     }
 }
 
 fn main() {
     let filename = "btree.db";
     let mut tree = BPlusTree::new(filename);
-    tree.insert("key1".as_bytes(), "value1".as_bytes());
-    tree.insert("key2".as_bytes(), "value2".as_bytes());
-    let result = tree.search("key2".as_bytes());
+    assert!(tree.insert(&1_i32.to_le_bytes(), "value1".as_bytes()));
+    assert!(tree.insert(&2_i32.to_le_bytes(), "value2".as_bytes()));
+    assert!(tree.insert(&3_i32.to_le_bytes(), "value3".as_bytes()));
+    assert!(tree.insert(&4_i32.to_le_bytes(), "value4".as_bytes()));
+    assert!(tree.insert(&5_i32.to_le_bytes(), "value5".as_bytes()));
+
+    let result = tree.search(&2_i32.to_le_bytes());
+    assert_eq!(result, "value2".as_bytes());
     println!("the value {:?}", String::from_utf8(result).unwrap());
 }
