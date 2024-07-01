@@ -82,7 +82,7 @@ impl InternalNode {
             num_of_children: 0,
             keys: Vec::new(),
             children: Vec::new(),
-            right_child: 0,
+            right_child,
         }
     }
 
@@ -142,7 +142,14 @@ impl InternalNode {
     fn search(&self, key: i32) -> Option<u8> {
         match self.keys.binary_search(&key) {
             Ok(key_index) => Some(self.children[key_index]),
-            Err(err) => Some(self.children[err]),
+            Err(insertion_index) => {
+                println!("the err index {}", insertion_index);
+                println!("children length {}", self.children.len());
+                if insertion_index == self.children.len() {
+                    return Some(self.right_child);
+                }
+                return Some(self.children[insertion_index]);
+            }
         }
     }
 }
@@ -288,6 +295,7 @@ impl LeafNode {
             slot.offset += shift_distance as u16;
         }
         self.slot_count -= 1;
+        self.slots.remove(position);
         true
     }
 
@@ -302,11 +310,9 @@ impl LeafNode {
     }
 
     fn split(&mut self, new_page_number: u8) -> (Vec<u8>, Self) {
-        println!("splitting leaf node");
         let midpoint = self.slots.len() / 2;
 
         let key_to_promote = self.slots[midpoint].key.clone();
-        println!("The key to promote {:?}", key_to_promote);
         let keys_to_move: Vec<Slot> = self.slots[midpoint + 1..]
             .iter()
             .map(|slot| slot.clone())
@@ -322,8 +328,8 @@ impl LeafNode {
                 (slot.key.clone(), data)
             })
             .collect();
-        println!("the key value pairs being moved {:?}", key_value_pairs);
         for slot in keys_to_move {
+            println!("deleting key {:?}", slot.key);
             self.delete(&slot.key);
         }
         let mut new_leaf = LeafNode::new(new_page_number);
@@ -334,10 +340,36 @@ impl LeafNode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum BPlusTreeNode {
     Internal(InternalNode),
     Leaf(LeafNode),
+}
+
+impl std::fmt::Debug for BPlusTreeNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BPlusTreeNode::Internal(node) => {
+                write!(
+                    f,
+                    "InternalNode(Page: {})\n  Keys: {:?}\n  Children: {:?}\n  Right Child(Page: {})\n",
+                    node.header.page_number, node.keys, node.children, node.right_child
+                )
+            }
+            BPlusTreeNode::Leaf(node) => {
+                write!(
+                    f,
+                    "LeafNode(Page: {})\n  Keys: {:?}\n",
+                    node.header.page_number,
+                    node.slots
+                        .iter()
+                        .map(|slot| String::from_utf8(slot.key.clone())
+                            .unwrap_or_else(|_| "<Invalid UTF-8>".to_string()))
+                        .collect::<Vec<_>>()
+                )
+            }
+        }
+    }
 }
 
 struct BPlusTree {
@@ -345,6 +377,63 @@ struct BPlusTree {
     file: File,
     next_page_number: u8,
     cache: Arc<Mutex<HashMap<u8, BPlusTreeNode>>>,
+}
+
+impl std::fmt::Debug for BPlusTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cache = self.cache.lock().unwrap();
+        let mut nodes = vec![(&self.root, 0)];
+
+        while let Some((node, level)) = nodes.pop() {
+            match node {
+                BPlusTreeNode::Internal(internal) => {
+                    writeln!(
+                        f,
+                        "{}InternalNode(Page: {})",
+                        "  ".repeat(level),
+                        internal.header.page_number
+                    )?;
+                    writeln!(f, "{}Keys: {:?}", "  ".repeat(level + 1), internal.keys)?;
+                    writeln!(
+                        f,
+                        "{}Children: {:?}",
+                        "  ".repeat(level + 1),
+                        internal.children
+                    )?;
+
+                    for &child_page in internal.children.iter().rev() {
+                        if let Some(child_node) = cache.get(&child_page) {
+                            nodes.push((child_node, level + 1));
+                        }
+                    }
+                    if let Some(child_node) = cache.get(&internal.right_child) {
+                        nodes.insert(0, (child_node, level + 1));
+                        // nodes.push((child_node, level + 1))
+                    }
+                }
+                BPlusTreeNode::Leaf(leaf) => {
+                    writeln!(
+                        f,
+                        "{}LeafNode(Page: {})",
+                        "  ".repeat(level),
+                        leaf.header.page_number
+                    )?;
+                    writeln!(
+                        f,
+                        "{}Keys: {:?}",
+                        "  ".repeat(level + 1),
+                        leaf.slots
+                            .iter()
+                            .map(|slot| String::from_utf8(slot.key.clone())
+                                .unwrap_or_else(|_| "<Invalid UTF-8>".to_string()))
+                            .collect::<Vec<_>>()
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl BPlusTree {
@@ -412,15 +501,19 @@ impl BPlusTree {
 
     fn insert(&mut self, key: &[u8], value: &[u8]) -> bool {
         let mut path: VecDeque<u64> = VecDeque::new();
-        let mut current_node = &mut self.root;
+        let mut current_root = &mut self.root;
         loop {
-            match current_node {
+            match current_root {
                 BPlusTreeNode::Internal(_internal) => (),
                 BPlusTreeNode::Leaf(leaf) => {
+                    let original_leaf_page_num = leaf.header.page_number;
                     if !leaf.insert(key, value) {
                         let new_leaf_node_page_num = self.next_page_number;
                         self.next_page_number += 1;
-                        let (key_to_promote, new_leaf_node) = leaf.split(new_leaf_node_page_num);
+                        let (key_to_promote, mut new_leaf_node) =
+                            leaf.split(new_leaf_node_page_num);
+                        new_leaf_node.insert(key, value);
+                        self.write_to_cache(original_leaf_page_num, &self.root);
                         self.write_to_cache(
                             new_leaf_node_page_num,
                             &BPlusTreeNode::Leaf(new_leaf_node),
@@ -431,12 +524,13 @@ impl BPlusTree {
                             let mut new_root =
                                 InternalNode::new(new_root_page_number, new_leaf_node_page_num);
                             let key: i32 = key_to_promote[0].into();
-                            new_root.insert(key, leaf.header.page_number);
+                            new_root.insert(key, original_leaf_page_num);
                             self.root = BPlusTreeNode::Internal(new_root);
                             self.write_to_cache(new_root_page_number, &self.root);
                         }
                         return true;
                     }
+                    self.write_to_cache(original_leaf_page_num, &self.root);
                     return true;
                 }
             };
@@ -470,8 +564,8 @@ fn main() {
     assert!(tree.insert(&3_i32.to_le_bytes(), "value3".as_bytes()));
     assert!(tree.insert(&4_i32.to_le_bytes(), "value4".as_bytes()));
     assert!(tree.insert(&5_i32.to_le_bytes(), "value5".as_bytes()));
+    println!("The tree {:?}", tree);
 
-    let result = tree.search(&2_i32.to_le_bytes());
-    assert_eq!(result, "value2".as_bytes());
-    println!("the value {:?}", String::from_utf8(result).unwrap());
+    let result = tree.search(&5_i32.to_le_bytes());
+    assert_eq!(result, "value5".as_bytes());
 }
