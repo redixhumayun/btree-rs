@@ -69,11 +69,11 @@ struct InternalNode {
     num_of_children: u8,
     keys: Vec<i32>,
     children: Vec<u8>,
-    right_child: u8,
+    right_child: Option<u8>,
 }
 
 impl InternalNode {
-    fn new(page_number: u8, right_child: u8) -> Self {
+    fn new(page_number: u8) -> Self {
         InternalNode {
             header: PageHeader {
                 node_type: NodeType::Internal,
@@ -82,7 +82,7 @@ impl InternalNode {
             num_of_children: 0,
             keys: Vec::new(),
             children: Vec::new(),
-            right_child,
+            right_child: None,
         }
     }
 
@@ -125,7 +125,7 @@ impl InternalNode {
         let right_child = bytes[offset];
         Ok(InternalNode {
             header: page_header,
-            right_child,
+            right_child: Some(right_child),
             num_of_children,
             keys,
             children,
@@ -139,18 +139,56 @@ impl InternalNode {
         true
     }
 
+    fn insert_for_promoted_key(&mut self, key: i32, left_child: u8, right_child: u8) -> bool {
+        let key_insert_position = self.keys.binary_search(&key).unwrap_or_else(|index| index);
+        if key_insert_position == self.keys.len() {
+            self.right_child = Some(right_child);
+        } else {
+            self.children[key_insert_position + 1] = right_child;
+        }
+        self.keys.insert(key_insert_position, key);
+        self.children.insert(key_insert_position, left_child);
+        true
+    }
+
+    fn delete(&mut self, key: i32) -> bool {
+        //  TODO: Check if this becomes less than half full and force a merge
+        let key_index = self.keys.binary_search(&key).unwrap();
+        self.keys.remove(key_index);
+        self.children.remove(key_index);
+        true
+    }
+
     fn search(&self, key: i32) -> Option<u8> {
         match self.keys.binary_search(&key) {
             Ok(key_index) => Some(self.children[key_index]),
             Err(insertion_index) => {
-                println!("the err index {}", insertion_index);
-                println!("children length {}", self.children.len());
                 if insertion_index == self.children.len() {
-                    return Some(self.right_child);
+                    return self.right_child;
                 }
                 return Some(self.children[insertion_index]);
             }
         }
+    }
+
+    fn split(&mut self, new_page_number: u8) -> (i32, Self, InternalNode) {
+        let median_index = self.keys.len() / 2;
+        let key_to_promote = self.keys[median_index];
+
+        //  create the new internal node and transfer keys and values past midpoint and the right child over
+        let mut new_internal_node = InternalNode::new(new_page_number);
+        new_internal_node.keys = self.keys.drain(median_index + 1..).collect();
+        new_internal_node.children = self.children.drain(median_index + 1..).collect();
+        new_internal_node.right_child = self.right_child;
+
+        //  child of promoted key becomes right child of original node
+        self.right_child = Some(self.children[median_index]);
+
+        //  remove the promoted key and it's child from the original node
+        self.keys.remove(median_index);
+        self.children.remove(median_index);
+
+        (key_to_promote, self.clone(), new_internal_node)
     }
 }
 
@@ -317,7 +355,6 @@ impl LeafNode {
             .iter()
             .map(|slot| slot.clone())
             .collect();
-        println!("The keys to move {:?}", keys_to_move);
         let key_value_pairs: Vec<_> = keys_to_move
             .iter()
             .map(|slot| {
@@ -329,7 +366,6 @@ impl LeafNode {
             })
             .collect();
         for slot in keys_to_move {
-            println!("deleting key {:?}", slot.key);
             self.delete(&slot.key);
         }
         let mut new_leaf = LeafNode::new(new_page_number);
@@ -352,7 +388,7 @@ impl std::fmt::Debug for BPlusTreeNode {
             BPlusTreeNode::Internal(node) => {
                 write!(
                     f,
-                    "InternalNode(Page: {})\n  Keys: {:?}\n  Children: {:?}\n  Right Child(Page: {})\n",
+                    "InternalNode(Page: {})\n  Keys: {:?}\n  Children: {:?}\n  Right Child(Page: {:?})\n",
                     node.header.page_number, node.keys, node.children, node.right_child
                 )
             }
@@ -406,9 +442,10 @@ impl std::fmt::Debug for BPlusTree {
                             nodes.push((child_node, level + 1));
                         }
                     }
-                    if let Some(child_node) = cache.get(&internal.right_child) {
-                        nodes.insert(0, (child_node, level + 1));
-                        // nodes.push((child_node, level + 1))
+                    if let Some(right_child) = internal.right_child {
+                        if let Some(child_node) = cache.get(&right_child) {
+                            nodes.insert(0, (child_node, level + 1));
+                        }
                     }
                 }
                 BPlusTreeNode::Leaf(leaf) => {
@@ -500,12 +537,21 @@ impl BPlusTree {
     }
 
     fn insert(&mut self, key: &[u8], value: &[u8]) -> bool {
-        let mut path: VecDeque<u64> = VecDeque::new();
-        let mut current_root = &mut self.root;
+        let mut path: VecDeque<u8> = VecDeque::new();
+        let mut current_root = self.root.clone();
         loop {
             match current_root {
-                BPlusTreeNode::Internal(_internal) => (),
-                BPlusTreeNode::Leaf(leaf) => {
+                BPlusTreeNode::Internal(internal) => {
+                    let original_internal_page_num = internal.header.page_number;
+                    let key_index = internal
+                        .search(i32::from_le_bytes(key.try_into().unwrap()))
+                        .unwrap();
+                    path.push_back(original_internal_page_num);
+                    let child_page_num = internal.children[key_index as usize];
+                    let child_node = self.read_page(child_page_num);
+                    current_root = child_node.clone();
+                }
+                BPlusTreeNode::Leaf(mut leaf) => {
                     let original_leaf_page_num = leaf.header.page_number;
                     if !leaf.insert(key, value) {
                         let new_leaf_node_page_num = self.next_page_number;
@@ -513,24 +559,75 @@ impl BPlusTree {
                         let (key_to_promote, mut new_leaf_node) =
                             leaf.split(new_leaf_node_page_num);
                         new_leaf_node.insert(key, value);
-                        self.write_to_cache(original_leaf_page_num, &self.root);
+
+                        let original_leaf_node = leaf.clone();
+                        self.write_to_cache(
+                            original_leaf_page_num,
+                            &BPlusTreeNode::Leaf(original_leaf_node),
+                        );
                         self.write_to_cache(
                             new_leaf_node_page_num,
                             &BPlusTreeNode::Leaf(new_leaf_node),
                         );
+
+                        let mut key: i32 = key_to_promote[0].into();
                         if path.is_empty() {
+                            //  No parent, create new root
                             let new_root_page_number = self.next_page_number;
                             self.next_page_number += 1;
-                            let mut new_root =
-                                InternalNode::new(new_root_page_number, new_leaf_node_page_num);
-                            let key: i32 = key_to_promote[0].into();
+                            let mut new_root = InternalNode::new(new_root_page_number);
                             new_root.insert(key, original_leaf_page_num);
                             self.root = BPlusTreeNode::Internal(new_root);
                             self.write_to_cache(new_root_page_number, &self.root);
+                            self.write_to_cache(original_leaf_page_num, &BPlusTreeNode::Leaf(leaf));
+                            return true;
+                        } else {
+                            //  Update existing parent
+                            while let Some(parent_page_num) = path.pop_back() {
+                                let mut parent_node = self.read_page(parent_page_num);
+                                if let BPlusTreeNode::Internal(ref mut parent_internal) =
+                                    parent_node
+                                {
+                                    if parent_internal.insert(key, original_leaf_page_num) {
+                                        self.write_to_cache(parent_page_num, &parent_node);
+                                        break;
+                                    }
+
+                                    //  need to split the parent node
+                                    let new_internal_page_number = self.next_page_number;
+                                    self.next_page_number += 1;
+                                    let (key_to_promote, left_internal_node, right_internal_node) =
+                                        parent_internal.split(new_internal_page_number);
+                                    let left_page_num = left_internal_node.header.page_number;
+                                    let right_page_num = right_internal_node.header.page_number;
+                                    self.write_to_cache(
+                                        left_internal_node.header.page_number,
+                                        &BPlusTreeNode::Internal(left_internal_node),
+                                    );
+                                    self.write_to_cache(
+                                        right_internal_node.header.page_number,
+                                        &BPlusTreeNode::Internal(right_internal_node),
+                                    );
+
+                                    if path.is_empty() {
+                                        //  create a root node and insert the key
+                                        let new_root_page_number = self.next_page_number;
+                                        self.next_page_number += 1;
+                                        let mut new_root = InternalNode::new(new_root_page_number);
+                                        new_root.insert(key_to_promote, left_page_num);
+                                        new_root.right_child = Some(right_page_num);
+                                        break;
+                                    }
+
+                                    //  there is already a parent node, change the key and allow loop iteration to continue
+                                    key = key_to_promote;
+                                } else {
+                                    panic!("one of the nodes in the path is not an internal node");
+                                }
+                            }
+                            return true;
                         }
-                        return true;
                     }
-                    self.write_to_cache(original_leaf_page_num, &self.root);
                     return true;
                 }
             };
@@ -568,4 +665,32 @@ fn main() {
 
     let result = tree.search(&5_i32.to_le_bytes());
     assert_eq!(result, "value5".as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::BPlusTree;
+
+    #[test]
+    fn check_leaf_split() {
+        let filename = "btree-test.db";
+        let mut tree = BPlusTree::new(filename);
+
+        tree.insert(&1_i32.to_le_bytes(), "value1".as_bytes());
+        tree.insert(&2_i32.to_le_bytes(), "value2".as_bytes());
+        tree.insert(&3_i32.to_le_bytes(), "value3".as_bytes());
+        tree.insert(&4_i32.to_le_bytes(), "value4".as_bytes());
+        tree.insert(&5_i32.to_le_bytes(), "value5".as_bytes());
+        tree.insert(&6_i32.to_le_bytes(), "value6".as_bytes());
+        tree.insert(&7_i32.to_le_bytes(), "value7".as_bytes());
+
+        println!("The tree {:?}", tree);
+
+        let result = tree.search(&5_i32.to_le_bytes());
+        assert_eq!(result, "value5".as_bytes());
+
+        std::fs::remove_file(PathBuf::from(filename)).unwrap();
+    }
 }
