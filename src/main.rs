@@ -692,7 +692,8 @@ impl BPlusTree {
                                 if key_insert_pos == parent_node.keys.len() - 1 {
                                     parent_node.right_child = Some(new_leaf_node_page_num);
                                 } else {
-                                    parent_node.set_child(key_insert_pos, new_leaf_node_page_num);
+                                    parent_node
+                                        .set_child(key_insert_pos + 1, new_leaf_node_page_num);
                                 }
                                 self.write_to_cache(
                                     parent_page_num.into(),
@@ -830,5 +831,6 @@ mod tests {
         tree.insert(&5_i32.to_le_bytes(), "value5".as_bytes());
         print_tree(&mut tree, filename);
         assert_eq!(tree.search(&9_i32.to_le_bytes()), "value9".as_bytes());
+        assert_eq!(tree.search(&7_i32.to_le_bytes()), "value7".as_bytes());
     }
 }
