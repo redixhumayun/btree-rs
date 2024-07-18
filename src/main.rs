@@ -172,6 +172,14 @@ impl InternalNode {
         true
     }
 
+    fn set_child(&mut self, index: usize, left_child: u8) -> bool {
+        if index >= self.keys.len() {
+            panic!("index is beyond keys length");
+        }
+        self.children[index] = left_child;
+        true
+    }
+
     fn insert_for_promoted_key(&mut self, key: i32, left_child: u8, right_child: u8) -> bool {
         let key_insert_position = self.keys.binary_search(&key).unwrap_or_else(|index| index);
         if key_insert_position == self.keys.len() {
@@ -203,11 +211,14 @@ impl InternalNode {
                 }
                 return PageNumber(self.children[key_index]);
             }
-            Err(_) => {
-                if let Some(right_child) = self.right_child {
-                    return PageNumber(right_child);
+            Err(insertion_index) => {
+                if insertion_index == self.keys.len() {
+                    if let Some(right_child) = self.right_child {
+                        return PageNumber(right_child);
+                    }
+                    panic!("could not find right child of an internal node");
                 }
-                panic!("could not find right child of an internal node");
+                return PageNumber(self.children[insertion_index]);
             }
         }
     }
@@ -636,7 +647,11 @@ impl BPlusTree {
                     //  the leaf does not have space, need to perform a split
                     let new_leaf_node_page_num = self.get_new_page_number();
                     let (key_to_promote, mut new_leaf_node) = leaf.split(new_leaf_node_page_num);
-                    new_leaf_node.insert(key, value);
+                    if i32::from_le_bytes(key.try_into().unwrap()) <= key_to_promote[0].into() {
+                        leaf.insert(key, value);
+                    } else {
+                        new_leaf_node.insert(key, value);
+                    }
 
                     let original_leaf_node = leaf.clone();
                     self.write_to_cache(
@@ -677,10 +692,7 @@ impl BPlusTree {
                                 if key_insert_pos == parent_node.keys.len() - 1 {
                                     parent_node.right_child = Some(new_leaf_node_page_num);
                                 } else {
-                                    parent_node.insert(
-                                        parent_node.keys[key_insert_pos + 1],
-                                        new_leaf_node_page_num,
-                                    );
+                                    parent_node.set_child(key_insert_pos, new_leaf_node_page_num);
                                 }
                                 self.write_to_cache(
                                     parent_page_num.into(),
@@ -769,8 +781,15 @@ mod tests {
 
     use crate::BPlusTree;
 
+    fn print_tree(tree: &mut BPlusTree, filename: &str) {
+        let root = tree.read_page(tree.get_root_page_number());
+        let tree_for_printing =
+            BPlusTree::tree_for_printing(filename, root, Arc::clone(&tree.cache));
+        println!("the tree {:?}", tree_for_printing);
+    }
+
     #[test]
-    fn check_leaf_split() {
+    fn check_leaf_split_sequential_writes() {
         let filename = "btree-test.db";
         let mut tree = BPlusTree::new(filename);
 
@@ -780,12 +799,7 @@ mod tests {
         tree.insert(&4_i32.to_le_bytes(), "value4".as_bytes());
         tree.insert(&5_i32.to_le_bytes(), "value5".as_bytes());
 
-        {
-            let root = tree.read_page(tree.get_root_page_number());
-            let tree_for_printing =
-                BPlusTree::tree_for_printing(filename, root, Arc::clone(&tree.cache));
-            println!("the tree {:?}", tree_for_printing);
-        }
+        print_tree(&mut tree, filename);
 
         let result = tree.search(&3_i32.to_le_bytes());
         assert_eq!(result, "value3".as_bytes());
@@ -793,16 +807,28 @@ mod tests {
         tree.insert(&6_i32.to_le_bytes(), "value6".as_bytes());
         tree.insert(&7_i32.to_le_bytes(), "value7".as_bytes());
 
-        {
-            let root = tree.read_page(tree.get_root_page_number());
-            let tree_for_printing =
-                BPlusTree::tree_for_printing(filename, root, Arc::clone(&tree.cache));
-            println!("the tree {:?}", tree_for_printing);
-        }
+        print_tree(&mut tree, filename);
 
         let result = tree.search(&5_i32.to_le_bytes());
         assert_eq!(result, "value5".as_bytes());
 
         std::fs::remove_file(PathBuf::from(filename)).unwrap();
+    }
+
+    #[test]
+    fn check_leaf_split_random_writes() {
+        let filename = "btree-test.db";
+        let mut tree = BPlusTree::new(filename);
+
+        tree.insert(&1_i32.to_le_bytes(), "value1".as_bytes());
+        tree.insert(&4_i32.to_le_bytes(), "value4".as_bytes());
+        tree.insert(&8_i32.to_le_bytes(), "value8".as_bytes());
+        tree.insert(&9_i32.to_le_bytes(), "value9".as_bytes());
+        tree.insert(&15_i32.to_le_bytes(), "value15".as_bytes());
+        tree.insert(&7_i32.to_le_bytes(), "value7".as_bytes());
+        tree.insert(&6_i32.to_le_bytes(), "value6".as_bytes());
+        tree.insert(&5_i32.to_le_bytes(), "value5".as_bytes());
+        print_tree(&mut tree, filename);
+        assert_eq!(tree.search(&9_i32.to_le_bytes()), "value9".as_bytes());
     }
 }
